@@ -18,3 +18,6 @@ merging/rebasing upstream and regression-testing each feature. Tag a checked
 commit and deploy exact image digests. This export preserves code bytes, not a
 new GPU,512K or task-quality qualification. No weights or private host state are
 included. Runtime/configuration/image distribution belongs to deployment tooling.
+
+Run `bash local/test-cache.sh /path/to/cache-check` for the fleet turn/cache
+pressure/superseded/config regressions, using an external C++20 host compiler.
