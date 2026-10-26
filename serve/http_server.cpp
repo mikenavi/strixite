@@ -4,6 +4,7 @@
 #include "serve/chat_template.hpp"
 #include "serve/log.hpp"
 #include "serve/openai.hpp"
+#include "serve/unicode.hpp"
 #include <httplib.h>  // third_party/cpp-httplib (vendored, SYSTEM include)
 
 #include <atomic>
@@ -35,18 +36,20 @@ std::string random_id(const char *prefix) {
 class QueueSink : public GenerationSink {
 public:
     struct Item {
-        enum class Kind { Start, Progress, Events, Done } kind;
+        enum class Kind { Start, Progress, Events, Logprob, Done } kind;
         PrefillProgress progress;
         std::vector<OutputEvent> events;
         GenerationResult result;
+        TokenLogprob logprob;
     };
-    void on_start() override { push({Item::Kind::Start, {}, {}, {}}); }
-    void on_prefill(const PrefillProgress &p) override { push({Item::Kind::Progress, p, {}, {}}); }
+    void on_start() override { push({Item::Kind::Start, {}, {}, {}, {}}); }
+    void on_prefill(const PrefillProgress &p) override { push({Item::Kind::Progress, p, {}, {}, {}}); }
     void on_events(std::vector<OutputEvent> &events) override {
-        push({Item::Kind::Events, {}, std::move(events), {}});
+        push({Item::Kind::Events, {}, std::move(events), {}, {}});
         events.clear();
     }
-    void on_done(const GenerationResult &r) override { push({Item::Kind::Done, {}, {}, r}); }
+    void on_done(const GenerationResult &r) override { push({Item::Kind::Done, {}, {}, r, {}}); }
+    void on_logprob(const TokenLogprob &p) override { Item it{}; it.kind=Item::Kind::Logprob; it.logprob=p; push(std::move(it)); }
     bool cancelled() override { return cancelled_.load(); }
     void cancel() { cancelled_ = true; }
 
@@ -155,6 +158,41 @@ void HttpServer::stop() {
 }
 
 void HttpServer::routes() {
+    const auto tokenize = [this](const httplib::Request &req,httplib::Response &res) {
+        try {
+            const auto body=json::Value::parse(req.body);
+            if(!body.is_object()) throw ApiError(400,"body must be an object");
+            const json::Value *content=nullptr;
+            for(const char *key:{"content","prompt","text"}) if(const auto *v=body.find(key)) {
+                if(!v->is_string()) throw ApiError(400,"tokenizer text must be a string",key);
+                if(content && content->as_string(key)!=v->as_string(key)) throw ApiError(400,"conflicting tokenizer text fields",key);
+                content=v;
+            }
+            if(!content) throw ApiError(400,"content is required","content");
+            bool parse_special=true, pieces=false;
+            for(const char *key:{"parse_special","with_pieces","add_special"}) if(const auto *v=body.find(key)) {
+                if(!v->is_bool()) throw ApiError(400,"tokenizer option must be boolean",key);
+                if(std::string(key)=="parse_special") parse_special=v->as_bool(key);
+                if(std::string(key)=="with_pieces") pieces=v->as_bool(key);
+            }
+            const auto &text=content->as_string("content");
+            const auto ids=parse_special ? tok_.encode(text) : tok_.encode(text,{{0,text.size()}});
+            auto out=json::Value::object(), tokens=json::Value::array(), token_ids=json::Value::array();
+            for(int32_t id:ids) {
+                token_ids.push(json::Value::integer(id));
+                if(!pieces) tokens.push(json::Value::integer(id));
+                else { auto v=json::Value::object();v.set("id",json::Value::integer(id));
+                    const auto &raw=tok_.token_bytes(id);v.set("piece",json::Value::string(unicode::replace_invalid_utf8(raw,nullptr)));
+                    auto b=json::Value::array();for(unsigned char c:raw)b.push(json::Value::integer(c));v.set("bytes",std::move(b));tokens.push(std::move(v)); }
+            }
+            out.set("tokens",std::move(tokens));out.set("token_ids",std::move(token_ids));out.set("count",json::Value::integer(ids.size()));
+            // This Qwen tokenizer has no automatic BOS; add_special does not prepend one.
+            res.set_content(out.dump(),"application/json");
+        } catch(const ApiError &e) { send_error(res,e.status,e.what(),e.type,e.param); }
+          catch(const std::exception &e) { send_error(res,400,e.what()); }
+    };
+    svr_->Post("/tokenize",tokenize);
+    svr_->Post("/v1/tokenize",tokenize);
     svr_->Post("/v1/chat/completions", [this](const httplib::Request &req, httplib::Response &res) {
         const int64_t id = ++next_id_;
         ChatRequest cr;
@@ -318,9 +356,12 @@ void HttpServer::routes() {
             if (!format_row.empty()) gen.log_header.emplace_back("format", format_row);
             if (!vision_note.empty()) gen.log_header.emplace_back("vision", vision_note);
         }
+        if(cr.logprobs && gen.max_tokens>4096)
+            return send_error(res,400,"logprobs require max_tokens <= 4096","invalid_request_error","max_tokens");
         gen.id = id, gen.stream = cr.stream;
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();
         gen.sampling = cr.sampling;
+        gen.logprobs = cr.logprobs; gen.top_logprobs = cr.top_logprobs;
         auto tools = std::make_shared<json::Value>(cr.tools);  // outlives the request inside the engine
         gen.parser.thinking = !(cr.template_options.enable_thinking.has_value() && !*cr.template_options.enable_thinking);
         gen.parser.tools = tools->is_null() ? nullptr : tools.get();
@@ -337,7 +378,7 @@ void HttpServer::routes() {
         auto sink = std::make_shared<QueueSink>();
         const bool thinking_on = !(cr.template_options.enable_thinking.has_value() && !*cr.template_options.enable_thinking);
         const ResponseMeta meta{random_id("chatcmpl-"), cfg_.model_id, unix_now(),
-                                thinking_skipped ? "skipped" : thinking_on ? "on" : "off"};
+                                thinking_skipped ? "skipped" : thinking_on ? "on" : "off", &tok_, cr.return_tokens_as_token_ids};
         try {
             engine_.submit(std::move(gen), sink);
         } catch (const std::exception &e) {
@@ -348,6 +389,7 @@ void HttpServer::routes() {
 
         if (!cr.stream) {
             std::string reasoning, content;
+            std::vector<TokenLogprob> probabilities;
             std::vector<ToolCallOut> calls;
             QueueSink::Item it;
             for (;;) {
@@ -361,10 +403,11 @@ void HttpServer::routes() {
                         else if (e.kind == OutputEvent::Kind::Content) content += e.text;
                         else if (e.kind == OutputEvent::Kind::ToolCall) calls.push_back(std::move(e.call));
                     }
+                if(it.kind==QueueSink::Item::Kind::Logprob) probabilities.push_back(std::move(it.logprob));
                 if (it.kind == QueueSink::Item::Kind::Done) break;
             }
             if (it.result.finish_reason == "error") return send_error(res, 500, it.result.error, "server_error");
-            res.set_content(completion_body(meta, reasoning, content, calls, it.result, clamped), "application/json");
+            res.set_content(completion_body(meta, reasoning, content, calls, it.result, clamped, cr.logprobs ? &probabilities : nullptr), "application/json");
             return;
         }
 
@@ -407,6 +450,9 @@ void HttpServer::routes() {
                     } else if (!comment(progress)) {
                         return false;
                     }
+                    break;
+                case QueueSink::Item::Kind::Logprob:
+                    if(!send(chunk_body(meta,json::Value::object(),nullptr,&it.logprob))) return false;
                     break;
                 case QueueSink::Item::Kind::Events:
                     for (size_t k = 0; k < it.events.size(); ++k) {
@@ -465,7 +511,8 @@ void HttpServer::routes() {
             }
             cr = parse_completion_request(body, cfg_.defaults);
             try {
-                gen.prompt = tok_.encode(cr.prompt);
+                gen.prompt = cr.prompt_ids.empty() ? tok_.encode(cr.prompt) : cr.prompt_ids;
+                for(int32_t t:gen.prompt) if(t<0 || t>=tok_.size()) throw ApiError(400,"unknown prompt token ID","prompt");
             } catch (const Error &e) {
                 throw ApiError(400, e.what(), "prompt");
             }
@@ -481,10 +528,14 @@ void HttpServer::routes() {
         gen.log_header.emplace_back("prompt", fmt_n((long long)gen.prompt.size()) + " tokens, raw completion (no chat template)");
         gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
         gen.log_header.emplace_back("sampling", sampling_text(cr.sampling, cr.seeded, cr.sampling_asked));
+        if(cr.logprobs && gen.max_tokens>4096)
+            return send_error(res,400,"logprobs require max_tokens <= 4096","invalid_request_error","max_tokens");
         gen.id = id, gen.stream = cr.stream;
         gen.one_shot = true;  // a raw prompt: its cache entries stay in RAM (benchmarks send many unique ones)
+        gen.logprobs_all_tokens = cr.logprobs;
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();
         gen.sampling = cr.sampling;
+        gen.logprobs = cr.logprobs; gen.top_logprobs = cr.top_logprobs;
         gen.parser.thinking = false;  // no think block: every token is text
         gen.parser.trim_ws = false;   // white space is part of a raw continuation
         gen.parser.tools = nullptr;
@@ -492,7 +543,7 @@ void HttpServer::routes() {
         gen.parser.id_seed = 0;
         gen.thinking_budget = -1;
         auto sink = std::make_shared<QueueSink>();
-        const ResponseMeta meta{random_id("cmpl-"), cfg_.model_id, unix_now(), ""};
+        const ResponseMeta meta{random_id("cmpl-"), cfg_.model_id, unix_now(), "", &tok_, cr.return_tokens_as_token_ids};
         try {
             engine_.submit(std::move(gen), sink);
         } catch (const std::exception &e) {
@@ -503,6 +554,7 @@ void HttpServer::routes() {
 
         if (!cr.stream) {
             std::string text;
+            std::vector<TokenLogprob> probabilities;
             QueueSink::Item it;
             for (;;) {
                 if (!sink->pop(it, 0.25)) {
@@ -512,10 +564,11 @@ void HttpServer::routes() {
                 if (it.kind == QueueSink::Item::Kind::Events)
                     for (const OutputEvent &e : it.events)
                         if (e.is_text()) text += e.text;
+                if(it.kind==QueueSink::Item::Kind::Logprob) probabilities.push_back(std::move(it.logprob));
                 if (it.kind == QueueSink::Item::Kind::Done) break;
             }
             if (it.result.finish_reason == "error") return send_error(res, 500, it.result.error, "server_error");
-            res.set_content(text_completion_body(meta, text, it.result, clamped), "application/json");
+            res.set_content(text_completion_body(meta, text, it.result, clamped, cr.logprobs ? &probabilities : nullptr), "application/json");
             return;
         }
 
@@ -541,6 +594,9 @@ void HttpServer::routes() {
                     progress = "prefill " + std::to_string(it.progress.processed) + "/" + std::to_string(it.progress.total);
                     if (!frame(rp ? "data: " + prompt_progress_chunk_body(meta, true, it.progress) + "\n\n" : ": " + progress + "\n\n"))
                         return false;
+                    break;
+                case QueueSink::Item::Kind::Logprob:
+                    if(!frame("data: "+text_chunk_body(meta,"",nullptr,&it.logprob)+"\n\n")) return false;
                     break;
                 case QueueSink::Item::Kind::Events:
                     for (const OutputEvent &e : it.events)

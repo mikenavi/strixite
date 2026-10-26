@@ -209,6 +209,7 @@ add_library(strix_serve STATIC
     serve/tokenizer.cpp
     serve/chat_template.cpp
     serve/sampler.cpp
+    serve/token_logprobs.cpp
     serve/output_parser.cpp
     serve/engine.cpp
     serve/seq_backend.cpp
@@ -263,3 +264,8 @@ target_link_libraries(strix_server PRIVATE strix_serve_model)
 if(EXISTS "${CMAKE_SOURCE_DIR}/tutorial/CMakeLists.txt")
     add_subdirectory(tutorial)
 endif()
+
+# Local CPU-only admission tests for the optional token-probability API.
+add_executable(strix_api_tests tests/api_probabilities.cpp)
+target_include_directories(strix_api_tests SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
+target_link_libraries(strix_api_tests PRIVATE strix_serve)
