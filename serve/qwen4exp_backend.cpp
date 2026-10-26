@@ -10,13 +10,26 @@
 namespace strix {
 
 Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp,
-                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv, int64_t n_seqs)
+                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv, int64_t n_seqs,
+                                 int boundary_snapshots, uint64_t boundary_budget_bytes, int boundary_images)
     : model_(model),
       session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp(), kv, n_seqs) {
     for (int k = 0; k < (int)n_seqs; ++k) {  // each conversation's own snapshot slots (a snapshot belongs to one state)
         snapshots_.emplace_back();
         for (int i = 0; i < 4; ++i) snapshots_.back().push_back(session_.make_snapshot(k));
     }
+    STRIX_CHECK(boundary_snapshots >= 0 && boundary_snapshots <= 32,
+                "Qwen4ExpBackend: boundary snapshots must be 0..32");
+    STRIX_CHECK(boundary_images >= 0 && boundary_images <= 32,
+                "Qwen4ExpBackend: boundary image snapshots must be 0..32");
+    boundary_images_ = std::min(boundary_images, boundary_snapshots);
+    const uint64_t boundary_bytes = snapshots_[0][0].device_bytes() * boundary_snapshots * n_seqs;
+    STRIX_CHECK(boundary_bytes <= boundary_budget_bytes,
+                "boundary snapshots need ", boundary_bytes, " bytes across all slots, budget ",
+                boundary_budget_bytes, "; reduce --boundary-snapshots or raise --boundary-snapshot-mib");
+    for (int k = 0; k < (int)n_seqs; ++k)
+        for (int i = 0; i < boundary_snapshots; ++i)
+            snapshots_[(size_t)k].push_back(session_.make_snapshot(k));
     STRIX_CHECK(mtp_vocab >= 0, "Qwen4ExpBackend: mtp_vocab ", mtp_vocab, ", expected >= 0 (0 = the whole vocabulary)");
     session_.set_precision(precision);
     if (mtp_vocab > 0) session_.set_mtp_vocab(mtp_vocab);
@@ -24,13 +37,13 @@ Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, i
 
 Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) {
     check_seq(seq, "snapshot");
-    STRIX_CHECK(slot == kTurnSlot || slot == kSystemSlot || slot == kDraftSlot || slot == kUserSlot,
+    STRIX_CHECK(slot >= 0 && slot < (int)snapshots_[(size_t)seq].size(),
                 "Qwen4ExpBackend: snapshot slot ", slot, " of seq ", seq);
     return snapshots_[(size_t)seq][(size_t)slot];
 }
 const Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) const {
     check_seq(seq, "snapshot");
-    STRIX_CHECK(slot == kTurnSlot || slot == kSystemSlot || slot == kDraftSlot || slot == kUserSlot,
+    STRIX_CHECK(slot >= 0 && slot < (int)snapshots_[(size_t)seq].size(),
                 "Qwen4ExpBackend: snapshot slot ", slot, " of seq ", seq);
     return snapshots_[(size_t)seq][(size_t)slot];
 }

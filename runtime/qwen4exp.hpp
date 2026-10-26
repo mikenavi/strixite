@@ -268,6 +268,15 @@ struct Qwen4ExpSeqState;  // the per-conversation state (below); a snapshot belo
 class Qwen4ExpSnapshot {
 public:
     int64_t pos() const { return pos_; }  // -1 until saved
+    // Fixed device state only; K/V below pos() is shared with the live sequence.
+    uint64_t device_bytes() const {
+        uint64_t n = ple_state_.size() + mtp_tail_.size() + mtp_prev_.size();
+        for (const auto &b : conv_) n += b.size();
+        for (const auto &b : rec_) n += b.size() * sizeof(float);
+        for (const auto &b : tail_) n += b.size();
+        for (const auto &b : kv8_tail_) n += b.size();
+        return n;
+    }
     // the saved rope_delta (0 for a prefix without images) and the continuation rule for the first row after
     // pos(): all three sections = pos() + rope_delta() when the saved span was uniform, the last saved row's
     // +1 in (h, w) when it was an image row (an image-span resume - restore refuses those today).

@@ -145,6 +145,8 @@ public:
     void keep_verify() override;
     void drop_verify() override;
     void keep_verify_prefix(const std::vector<int32_t> &ids, int64_t rows) override;
+    int boundary_snapshot_count() const override { return arb_.backend().boundary_snapshot_count(); }
+    int boundary_image_snapshot_count() const override { return arb_.backend().boundary_image_snapshot_count(); }
     void save_snapshot(int slot) override;
     int64_t snapshot_pos(int slot) const override;
     bool can_restore_snapshot(int slot) const override;

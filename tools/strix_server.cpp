@@ -207,7 +207,12 @@ int run(int argc, char **argv) {
              (long long)cfg.vision_preprocess_limit);
     }
     const int64_t total_slots = settings.integer("total-slots");
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots);
+    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots,
+                           (int)settings.integer("boundary-snapshots"),
+                           (uint64_t)settings.integer("boundary-snapshot-mib") << 20,
+                           (int)settings.integer("boundary-image-snapshots"));
+    slog(LogLevel::Info, "startup: boundary snapshots %d per slot (%d image anchors), %.1f MiB total fixed device state (shared K/V)",
+         backend.boundary_snapshot_count(), backend.boundary_image_snapshot_count(), backend.boundary_snapshot_bytes() / (double)(1ull << 20));
     if (total_slots > 1)
         slog(LogLevel::Info, "startup: %lld slots: %lld conversations at once, each at the full capacity %s",
              (long long)total_slots, (long long)total_slots, fmt_n(capacity).c_str());

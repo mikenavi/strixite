@@ -2,6 +2,7 @@
 
 #include "common/args.hpp"
 #include "common/check.hpp"
+#include "serve/boundary_snapshots.hpp"
 #include "serve/http_server.hpp"
 #include "serve/prompt_cache.hpp"
 
@@ -272,6 +273,12 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "a cache write never leaves less than this many GiB free on the cache's filesystem"},
         {"prompt-cache-checkpoints", K::Int, 1, 1000, std::to_string(cache.checkpoints_per_chain),
          "prompt cache checkpoints kept per conversation"},
+        {"boundary-snapshots", K::Int, 0, 32, "0",
+         "extra live-sequence recurrent snapshots at message/image boundaries; 0 disables (experimental)"},
+        {"boundary-image-snapshots", K::Int, 0, 32, std::to_string(kDefaultBoundaryImageSnapshots),
+         "boundary slots reserved for image predecessors; capped by boundary-snapshots, remainder for recent messages"},
+        {"boundary-snapshot-mib", K::Int, 0, 65536, "2048",
+         "maximum device MiB for extra boundary snapshots across ALL serving slots; no full K/V copies"},
         {"prompt-cache-delta-max-tokens", K::Int, 0, 1 << 24, std::to_string(cache.delta_max_tokens),
          "a turn is saved as a delta on the whole entry it extends while it adds at most this many tokens (and a "
          "quarter of the base); 0 = every entry whole"},

@@ -1,4 +1,5 @@
 #include "serve/engine.hpp"
+#include "serve/boundary_snapshots.hpp"
 #include "serve/seq_backend.hpp"
 #include "serve/think_nudge.hpp"
 
@@ -350,7 +351,8 @@ int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64
     // In memory: the live state if the prompt extends it, else the better of the snapshots.
     int64_t best = 0, how = -2;  // -1 = live, >= 0 = slot
     if (lcp == (int64_t)sl.seq.size() && lcp < P && sl.be->pos() == lcp) best = lcp, how = -1;
-    for (int slot : {LmBackend::kTurnSlot, LmBackend::kSystemSlot, LmBackend::kUserSlot}) {
+    for (int slot = 0; slot < 4 + sl.be->boundary_snapshot_count(); ++slot) {
+        if (slot == LmBackend::kDraftSlot) continue;  // MTP scratch is not a reusable prompt checkpoint
         const int64_t sp = sl.be->snapshot_pos(slot);
         if (sp > best && sp <= lcp && sp < P && sl.be->can_restore_snapshot(slot)) best = sp, how = slot;
     }
@@ -402,7 +404,10 @@ int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64
                  fmt_n(P).c_str(),
                  how == LmBackend::kTurnSlot     ? "the previous prompt's end"
                  : how == LmBackend::kSystemSlot ? "the system prompt's end"
-                                                 : "the start of the previous prompt's last user message");
+                                                 : how == LmBackend::kUserSlot   ? "the start of the previous prompt's last user message"
+                                                 : how < 4 + sl.be->boundary_image_snapshot_count()
+                                                     ? "a boundary: the message before an image (protected)"
+                                                     : "a boundary: a recent message start");
         return best;
     }
     sl.be->reset();
@@ -666,6 +671,29 @@ void Engine::run(Job &job, Slot &sl) {
             row_masks.preserve_unmasked = req.logprobs;
             return &row_masks;
         };
+        // Extra snapshots share this sequence's K/V; they never enter the host/disk prompt cache.
+        std::vector<int64_t> image_rows;
+        for (const auto &im : req.prefill_images) image_rows.push_back(im.row_start);
+        const int boundary_count = sl.be->boundary_snapshot_count();
+        const auto boundaries = boundary_snapshot_plan(prompt, im_start_, image_rows, sys, cut, boundary_count, sl.be->boundary_image_snapshot_count());
+        const auto save_boundary = [&](int64_t pos) {
+            for (const auto &point : boundaries) {
+                if (point.pos != pos) continue;
+                const int anchors = sl.be->boundary_image_snapshot_count();
+                const int begin = point.image ? 4 : 4 + anchors;
+                const int end = point.image ? 4 + anchors : 4 + boundary_count;
+                int chosen = -1;
+                int64_t oldest = INT64_MAX;
+                for (int s = begin; s < end; ++s) {
+                    const bool valid = sl.be->can_restore_snapshot(s);
+                    const int64_t n = sl.be->snapshot_pos(s);
+                    if (valid && n == pos) { chosen = -1; break; }
+                    const int64_t age = valid ? n : -1;
+                    if (age < oldest) oldest = age, chosen = s;
+                }
+                if (chosen >= 0) sl.be->save_snapshot(chosen);
+            }
+        };
         // A chunk ends at the backend's max chunk, and at the turn / user-start / system snapshot points.
         // An image prompt (Phase D) also ends at the image block edges: one forward carries one whole block
         // (Phase B's one-image-per-forward contract), and a block ends at a max-chunk multiple before any
@@ -682,6 +710,8 @@ void Engine::run(Job &job, Slot &sl) {
             if (!has_images && arbiter_ && options_.shared_chunk > 0 && arbiter_->others_decoding(sl.index))
                 step = std::min(step, options_.shared_chunk);
             int64_t end = std::min(P, pos + step);
+            for (const auto &point : boundaries)
+                if (point.pos > pos && point.pos < end) end = point.pos;
             if (cut > pos && cut < end) end = cut;
             if (ust > pos && ust < end) end = ust;
             if (save_sys && sys > pos && sys < end) end = sys;
@@ -701,6 +731,7 @@ void Engine::run(Job &job, Slot &sl) {
         const double t_prefill = now_s();
         const auto progress = [&](int64_t pos) { sink.on_prefill({P, start, pos, (now_s() - t_prefill) * 1e3}); };
         progress(start);
+        save_boundary(start);
         if (start == ust)  // resumed exactly at the user turn: its start state is the live state right now
             sl.be->save_snapshot(LmBackend::kUserSlot);
         for (int64_t pos = start; pos < P;) {
@@ -742,6 +773,7 @@ void Engine::run(Job &job, Slot &sl) {
                 stats_.prefill_tokens += end - pos;
             }
             pos = end;
+            save_boundary(pos);
             if (pos == cut) sl.be->save_snapshot(LmBackend::kTurnSlot);
             if (pos == ust) sl.be->save_snapshot(LmBackend::kUserSlot);
             if (save_sys && pos == sys) sl.be->save_snapshot(LmBackend::kSystemSlot);
