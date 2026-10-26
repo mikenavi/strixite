@@ -33,6 +33,7 @@ Top2 top2(const float *x, int64_t n);
 struct LogitRows {
     int64_t rows = 0, row = 0;        // full rows: row = floats per row
     std::vector<float> full;          // [rows, row]; empty for candidates
+    std::vector<float> unmasked;      // optional raw target rows for logprobs
     int64_t cands = 0;                // candidates per row; 0 = full rows
     std::vector<float> cand_v;        // [rows, cands]
     std::vector<int32_t> cand_id;     // [rows, cands]
@@ -46,6 +47,7 @@ struct LogitRows {
 // bit (id % 32) of word (id / 32) of row r set = id allowed. A backend gives back only allowed ids - candidates from
 // the allowed ids alone (kernels/logits_topk's mask), full rows with every disallowed logit set to -inf.
 struct LogitMasks {
+    bool preserve_unmasked = false;  // diagnostic logprobs only
     int64_t rows = 0, words = 0;  // words per row: >= ceil(logits row / 32)
     std::vector<uint32_t> bits;   // [rows, words]
     bool empty() const { return rows == 0; }

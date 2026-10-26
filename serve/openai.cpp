@@ -140,13 +140,23 @@ template <typename R> void parse_common(const json::Value &body, R &r, bool lega
         for (const std::string &s : r.stop)
             if (s.empty()) bad("stop", "stop strings must be non-empty");
     }
+    if (const auto *v=field(body,"return_tokens_as_token_ids"))
+        r.return_tokens_as_token_ids=get_bool(*v,"return_tokens_as_token_ids");
     // Known but unsupported: refused rather than silently ignored.
     if (const json::Value *v = field(body, "n"); v && get_int(*v, "n") != 1) bad("n", "only n = 1 is supported");
     if (const json::Value *v = field(body, "logprobs")) {
-        // Chat: a boolean; legacy completions: the number of top logprobs per token (0 = none).
-        if (legacy_completions ? get_int(*v, "logprobs") != 0 : get_bool(*v, "logprobs")) bad("logprobs", "logprobs are not supported");
+        if (legacy_completions) {
+            const int64_t n=get_int(*v,"logprobs");
+            if(n<0 || n>20) bad("logprobs","logprobs must be in 0..20");
+            r.logprobs=true; r.top_logprobs=(int)n;
+        } else r.logprobs=get_bool(*v,"logprobs");
     }
-    if (field(body, "top_logprobs")) bad("top_logprobs", "logprobs are not supported");
+    if (const json::Value *v=field(body,"top_logprobs")) {
+        if(legacy_completions || !r.logprobs) bad("top_logprobs","top_logprobs requires chat logprobs:true");
+        const int64_t n=get_int(*v,"top_logprobs");
+        if(n<0 || n>20) bad("top_logprobs","top_logprobs must be in 0..20");
+        r.top_logprobs=(int)n;
+    }
     for (const char *pen : {"presence_penalty", "frequency_penalty", "repetition_penalty"})
         if (const json::Value *v = field(body, pen); v && get_number(*v, pen) != (std::string(pen) == "repetition_penalty" ? 1.0 : 0.0))
             bad(pen, std::string("'") + pen + "' is not supported");
@@ -452,8 +462,14 @@ CompletionRequest parse_completion_request(const json::Value &body, const Sampli
     if (p->is_string()) r.prompt = p->as_string("prompt");
     else if (p->is_array() && p->as_array("prompt").size() == 1 && p->as_array("prompt")[0].is_string())
         r.prompt = p->as_array("prompt")[0].as_string("prompt");
-    else bad("prompt", "'prompt' must be a string (or an array of one string); token-id prompts and batches are not supported");
-    if (r.prompt.empty()) bad("prompt", "'prompt' must not be empty");
+    else if(p->is_array() && !p->as_array("prompt").empty()) {
+        for(const auto &v:p->as_array("prompt")) {
+            const int64_t id=get_int(v,"prompt");
+            if(id<0 || id>INT32_MAX) bad("prompt","prompt token ID out of range");
+            r.prompt_ids.push_back((int32_t)id);
+        }
+    } else bad("prompt", "prompt must be a string or a non-empty token ID array");
+    if (r.prompt.empty() && r.prompt_ids.empty()) bad("prompt", "'prompt' must not be empty");
     if (const json::Value *v = field(body, "model"); v && v->is_string()) r.model = v->as_string("model");
     parse_common(body, r, /*legacy_completions=*/true);
     if (const json::Value *v = field(body, "echo"); v && get_bool(*v, "echo")) bad("echo", "'echo' is not supported");
@@ -463,11 +479,12 @@ CompletionRequest parse_completion_request(const json::Value &body, const Sampli
     return r;
 }
 
-std::string chunk_body(const ResponseMeta &m, const json::Value &delta, const char *finish_reason) {
+std::string chunk_body(const ResponseMeta &m, const json::Value &delta, const char *finish_reason, const TokenLogprob *prob) {
     json::Value b = envelope(m, "chat.completion.chunk");
     json::Value choice = json::Value::object();
     choice.set("index", json::Value::integer(0));
     choice.set("delta", delta);
+    if(prob) { STRIX_CHECK(m.tokenizer,"logprobs require tokenizer"); choice.set("logprobs",chat_logprobs({*prob},*m.tokenizer,m.return_tokens_as_token_ids)); }
     choice.set("finish_reason", finish_reason ? json::Value::string(finish_reason) : json::Value());
     json::Value choices = json::Value::array();
     choices.push(std::move(choice));
@@ -485,7 +502,7 @@ std::string usage_chunk_body(const ResponseMeta &m, const GenerationResult &r, b
 }
 
 std::string completion_body(const ResponseMeta &m, const std::string &reasoning, const std::string &content,
-                            const std::vector<ToolCallOut> &calls, const GenerationResult &r, bool clamped) {
+                            const std::vector<ToolCallOut> &calls, const GenerationResult &r, bool clamped, const std::vector<TokenLogprob> *probs) {
     json::Value b = envelope(m, "chat.completion");
     json::Value msg = json::Value::object();
     msg.set("role", json::Value::string("assistant"));
@@ -502,6 +519,7 @@ std::string completion_body(const ResponseMeta &m, const std::string &reasoning,
     json::Value choice = json::Value::object();
     choice.set("index", json::Value::integer(0));
     choice.set("message", std::move(msg));
+    if(probs) { STRIX_CHECK(m.tokenizer,"logprobs require tokenizer"); choice.set("logprobs",chat_logprobs(*probs,*m.tokenizer,m.return_tokens_as_token_ids)); }
     choice.set("finish_reason", json::Value::string(r.finish_reason));
     json::Value choices = json::Value::array();
     choices.push(std::move(choice));
@@ -513,20 +531,21 @@ std::string completion_body(const ResponseMeta &m, const std::string &reasoning,
 }
 
 namespace {
-json::Value text_choice(const std::string &text, const json::Value &finish_reason) {
+json::Value text_choice(const std::string &text, const json::Value &finish_reason, const json::Value *probs=nullptr) {
     json::Value c = json::Value::object();
     c.set("index", json::Value::integer(0));
     c.set("text", json::Value::string(text));
-    c.set("logprobs", json::Value());
+    c.set("logprobs", probs ? *probs : json::Value());
     c.set("finish_reason", finish_reason);
     return c;
 }
 }  // namespace
 
-std::string text_completion_body(const ResponseMeta &m, const std::string &text, const GenerationResult &r, bool clamped) {
+std::string text_completion_body(const ResponseMeta &m, const std::string &text, const GenerationResult &r, bool clamped, const std::vector<TokenLogprob> *probs) {
     json::Value b = envelope(m, "text_completion");
     json::Value choices = json::Value::array();
-    choices.push(text_choice(text, json::Value::string(r.finish_reason)));
+    json::Value lp; if(probs) { STRIX_CHECK(m.tokenizer,"logprobs require tokenizer"); lp=legacy_logprobs(*probs,*m.tokenizer,m.return_tokens_as_token_ids); }
+    choices.push(text_choice(text, json::Value::string(r.finish_reason), probs ? &lp : nullptr));
     b.set("choices", std::move(choices));
     b.set("usage", usage_json(r));
     b.set("timings", timings_json(r));
@@ -534,10 +553,11 @@ std::string text_completion_body(const ResponseMeta &m, const std::string &text,
     return b.dump();
 }
 
-std::string text_chunk_body(const ResponseMeta &m, const std::string &text, const char *finish_reason) {
+std::string text_chunk_body(const ResponseMeta &m, const std::string &text, const char *finish_reason, const TokenLogprob *prob) {
     json::Value b = envelope(m, "text_completion");
     json::Value choices = json::Value::array();
-    choices.push(text_choice(text, finish_reason ? json::Value::string(finish_reason) : json::Value()));
+    json::Value lp; if(prob) { STRIX_CHECK(m.tokenizer,"logprobs require tokenizer"); lp=legacy_logprobs({*prob},*m.tokenizer,m.return_tokens_as_token_ids); }
+    choices.push(text_choice(text, finish_reason ? json::Value::string(finish_reason) : json::Value(), prob ? &lp : nullptr));
     b.set("choices", std::move(choices));
     return b.dump();
 }

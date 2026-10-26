@@ -32,6 +32,9 @@ struct ChatRequest {
     // today's 400.
     std::vector<vision::ParsedImage> images;
     bool stream = false;
+    bool logprobs = false;
+    bool return_tokens_as_token_ids = false;
+    int top_logprobs = 0;
     bool return_progress = false;  // streamed: prefill progress as data chunks (prompt_progress_chunk_body)
     std::string model;  // as asked (any name is served: logged, not refused)
     std::optional<int64_t> max_tokens;
@@ -55,7 +58,11 @@ struct ChatRequest {
 // logprobs > 0, token-id / batched prompts.
 struct CompletionRequest {
     std::string prompt;
+    std::vector<int32_t> prompt_ids;
     bool stream = false;
+    bool logprobs = false;
+    bool return_tokens_as_token_ids = false;
+    int top_logprobs = 0;
     bool return_progress = false;
     std::string model;
     std::optional<int64_t> max_tokens;
@@ -95,15 +102,17 @@ struct ResponseMeta {
     std::string id, model;
     int64_t created = 0;
     std::string thinking;  // strix.thinking: "on" | "off" | "skipped" (thinking_left_out); empty = not reported
+    const Tokenizer *tokenizer = nullptr;  // logprobs serialization only
+    bool return_tokens_as_token_ids = false;
 };
 // A streamed call (OutputParser::Config::stream_calls) as OpenAI streams one: the first delta with id, type, name
 // and empty arguments, then deltas with only the index and the next piece of the arguments.
 json::Value tool_call_start_delta(const ToolCallOut &c, int index);
 json::Value tool_call_args_delta(const std::string &piece, int index);
-std::string chunk_body(const ResponseMeta &m, const json::Value &delta, const char *finish_reason);
+std::string chunk_body(const ResponseMeta &m, const json::Value &delta, const char *finish_reason, const TokenLogprob *prob = nullptr);
 std::string usage_chunk_body(const ResponseMeta &m, const GenerationResult &r, bool clamped);
 std::string completion_body(const ResponseMeta &m, const std::string &reasoning, const std::string &content,
-                            const std::vector<ToolCallOut> &calls, const GenerationResult &r, bool clamped);
+                            const std::vector<ToolCallOut> &calls, const GenerationResult &r, bool clamped, const std::vector<TokenLogprob> *probs = nullptr);
 json::Value tool_call_delta(const ToolCallOut &c, int index);
 // A streamed chunk that carries only where the prefill stands, for a request that set return_progress: a choice with
 // an empty delta (chat) or empty text (legacy completions), and a top-level "prompt_progress" {total, cache,
@@ -111,8 +120,8 @@ json::Value tool_call_delta(const ToolCallOut &c, int index);
 std::string prompt_progress_chunk_body(const ResponseMeta &m, bool legacy_completions, const PrefillProgress &p);
 // Legacy completions ("text_completion"): the whole response, a streamed text chunk (finish_reason null until the
 // last), and the final usage chunk (empty choices, as chat's).
-std::string text_completion_body(const ResponseMeta &m, const std::string &text, const GenerationResult &r, bool clamped);
-std::string text_chunk_body(const ResponseMeta &m, const std::string &text, const char *finish_reason);
+std::string text_completion_body(const ResponseMeta &m, const std::string &text, const GenerationResult &r, bool clamped, const std::vector<TokenLogprob> *probs = nullptr);
+std::string text_chunk_body(const ResponseMeta &m, const std::string &text, const char *finish_reason, const TokenLogprob *prob = nullptr);
 std::string text_usage_chunk_body(const ResponseMeta &m, const GenerationResult &r, bool clamped);
 json::Value usage_json(const GenerationResult &r);
 json::Value timings_json(const GenerationResult &r);

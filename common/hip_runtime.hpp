@@ -7,6 +7,8 @@
 // standard header included after HIP's reads [[__gnu__::]] - "error: expected identifier". Including <format> first
 // lets its include guard keep the macro out of it.
 
+#if __has_include(<format>)
 #include <format>
+#endif
 
 #include <hip/hip_runtime.h>

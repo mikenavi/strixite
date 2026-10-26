@@ -23,6 +23,7 @@
 #include "serve/think_nudge.hpp"
 #include "serve/token_mask.hpp"
 #include "serve/tokenizer.hpp"
+#include "serve/token_logprobs.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -288,6 +289,10 @@ private:
 };
 
 struct GenerationRequest {
+    bool logprobs = false;
+    // Raw completion diagnostics retain sampled structural/EOS tokens even when no text is emitted.
+    bool logprobs_all_tokens = false;
+    int top_logprobs = 0;
     std::vector<int32_t> prompt;
     // Image prompt (vision): per prompt row the (t, h, w) section positions of the mRoPE walk
     // (serve/vision_request.cpp, the get_rope_index rule) and the images with their spans, stream
@@ -384,6 +389,7 @@ public:
     // The same with the cached tokens and the time, once more at the resume point: the engine calls this one.
     virtual void on_prefill(const PrefillProgress &p) { on_progress(p.processed, p.total); }
     virtual void on_events(std::vector<OutputEvent> &events) = 0;
+    virtual void on_logprob(const TokenLogprob &p) { (void)p; }
     virtual void on_done(const GenerationResult &r) = 0;
     virtual bool cancelled() = 0;  // polled between chunks and tokens
 };

@@ -650,7 +650,7 @@ void Engine::run(Job &job, Slot &sl) {
         // Logits rows as the sampler takes them: for greedy / top_k 1..20 (the served defaults) each row's top 20
         // candidates, reduced where the logits are (kernels/logits_topk on the real model) - ~160 bytes a row to the
         // host instead of ~1 MB and a full-row scan; same tokens either way.
-        const bool cands = Sampler(req.sampling, tok_.size()).takes_candidates();
+        const bool cands = !req.logprobs && Sampler(req.sampling, tok_.size()).takes_candidates();
         const int64_t n_valid = tok_.size();
         LogitRows logits;
         // Structured output (response_format / tool_choice): every logits row from the prompt's last one on is masked
@@ -663,6 +663,7 @@ void Engine::run(Job &job, Slot &sl) {
         const auto masks_for = [&](const std::vector<int32_t> &pending) -> const LogitMasks * {
             if (!so) return nullptr;
             row_masks = so->masks_for(pending);
+            row_masks.preserve_unmasked = req.logprobs;
             return &row_masks;
         };
         // A chunk ends at the backend's max chunk, and at the turn / user-start / system snapshot points.
@@ -797,6 +798,7 @@ void Engine::run(Job &job, Slot &sl) {
         // (`id_of("<|im_end|>")`), ending the turn mid thought or mid call.
         const std::vector<int32_t> end_ids{im_end_, eot_};
         const auto guard = [&](LogitRows &rows, int64_t r) {
+            if (req.logprobs && rows.unmasked.empty()) rows.unmasked = rows.full;
             if (options_.think_end_guard && (parser.in_reasoning() || parser.in_call()) && ban_tokens(rows, r, end_ids))
                 ++res.think_end_blocked;
         };
@@ -822,6 +824,23 @@ void Engine::run(Job &job, Slot &sl) {
                    ends_sentence(think_tail);
         };
         std::vector<OutputEvent> events;
+        std::string probability_bytes;
+        // Only sampled target tokens receive probabilities. Inserted budget/nudge text does not.
+        const auto emit_probability = [&](int32_t id, const LogitRows &rows, int64_t row, bool reasoning) {
+            auto p = token_logprob(rows, row, id, req.top_logprobs, tok_);
+            p.reasoning = reasoning;
+            p.text_offset = complete_utf8_characters(probability_bytes);
+            probability_bytes += p.bytes;
+            sink.on_logprob(p);
+        };
+        const auto parse_sample = [&](int32_t id, const LogitRows &rows, int64_t row) {
+            const bool reasoning = parser.in_reasoning(), call = parser.in_call();
+            const bool stopped = parser.feed(id, events);
+            if (req.logprobs && (req.logprobs_all_tokens ||
+                                (!call && !parser.in_call() && reasoning == parser.in_reasoning())))
+                emit_probability(id, rows, row, !req.logprobs_all_tokens && reasoning);
+            return stopped;
+        };
         std::string reason;
         std::vector<CaptureStep> steps;  // what each decode step did, for --capture-dir
         auto step = [&](int64_t drafted, int64_t accepted, int64_t emitted) {
@@ -935,6 +954,7 @@ void Engine::run(Job &job, Slot &sl) {
                 id = sampler.sample(logits, 0);
                 ++res.completion_tokens;
                 if (id == im_end_ || id == eot_) {
+                    if (req.logprobs && req.logprobs_all_tokens) emit_probability(id, logits, 0, false);
                     reason = "stop";
                     break;
                 }
@@ -946,7 +966,7 @@ void Engine::run(Job &job, Slot &sl) {
                     continue;
                 }
                 if (so) so->feed(id);
-                const bool stopped = parser.feed(id, events);
+                const bool stopped = parse_sample(id, logits, 0);
                 watch_tok(id);
                 if (!events.empty()) sink.on_events(events), events.clear();
                 if (stopped) {
@@ -1017,7 +1037,7 @@ void Engine::run(Job &job, Slot &sl) {
                         if (v != ids[(size_t)j + 1]) break;
                         ++res.mtp_accepted_tokens, ++res.completion_tokens;
                         if (so) so->feed(v);
-                        const bool st = parser.feed(v, events);
+                        const bool st = parse_sample(v, ml, j);
                         watch_tok(v);
                         if (!events.empty()) sink.on_events(events), events.clear();
                         if (st || res.completion_tokens >= req.max_tokens) {
@@ -1069,6 +1089,7 @@ void Engine::run(Job &job, Slot &sl) {
                     sl.be->keep_verify_prefix(ids, j + 1);
                     sl.seq.insert(sl.seq.end(), ids.begin(), ids.begin() + j + 1);
                     if (v == im_end_ || v == eot_) {
+                        if (req.logprobs && req.logprobs_all_tokens) emit_probability(v, ml, j, false);
                         step(k, j, j + 1);
                         reason = "stop";
                         break;
@@ -1082,7 +1103,7 @@ void Engine::run(Job &job, Slot &sl) {
                         continue;
                     }
                     if (so) so->feed(v);
-                    const bool st = parser.feed(v, events);
+                    const bool st = parse_sample(v, ml, j);
                     watch_tok(v);
                     if (!events.empty()) sink.on_events(events), events.clear();
                     step(k, j, j + 1);  // v is emitted by the next step
