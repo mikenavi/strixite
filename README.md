@@ -1,3 +1,5 @@
+> **mikenavi fleet fork:** see [README.fleet.md](README.fleet.md) for the pinned component, local changes, build and qualification limits.
+
 <p align="center"><img src="assets/strixite-banner.jpg" alt="strixite - LLM inference, from scratch, for AMD Strix Halo" width="100%"></p>
 
 <p align="center">
