@@ -11,6 +11,7 @@ an upstream pull request:
 | `fix/qsa-split-deep-batches` | QSA automatic split for deep serving batches | #31 |
 | `feat/turn-retention-superseded-branches` | four evictable turn endpoints, superseded branches, CPU tests | #32 |
 | `feat/boundary-snapshots` | bounded recent message and protected image predecessor snapshots (on the API branch) | #33 |
+| `fix/optional-format-include` | `<format>` only where libstdc++ has it, so the GCC 12 SDK image builds upstream | — |
 
 Update: merge upstream `main` into each feature branch and fix it there, then merge
 upstream `main` and the feature branches into this branch. A feature that upstream
