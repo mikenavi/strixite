@@ -8,7 +8,7 @@
     "common/log.hpp": "1e89d86eeae03e5b72f8e61e3e4cecbc51e689a0f11c34187b552d54c9ceac98",
     "common/args.hpp": "45c7c3062c4f30a39cb9955f2b03f65c1cc4bf06ce83fd48b5d7976cd01b2cb5",
     "common/hip_check.hpp": "004eda0116bb4b2212c33bd595bfc5a914f2cf211403fd277b2eb1edaeb5dbd0",
-    "common/hip_runtime.hpp": "09b3f83a788b2d25dcf5df2fc51a36302f23ba3993b85d4b6a7ca4e572ca7f75",
+    "common/hip_runtime.hpp": "2cfd6764b9216ff5c7d0d1065c31fc1474e3407fd528630686ead36ed4b5ab0f",
     "common/bf16.hpp": "6898ee6aef55cc4944a45590ca5e73a6e937f456fe3f1e6148a1163c013a5181",
     "common/check.hpp": "c0d16aa6f360e04720d24e75697c3d4e0f2d5593a3e86671ea567b731a6a1034",
     "formats/q8.cpp": "0d46025a1912049e3e7816eee25ba920436f8d960fe325ff4c6a351be708453c",
