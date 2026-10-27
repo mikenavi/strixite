@@ -269,3 +269,10 @@ endif()
 add_executable(strix_api_tests tests/api_probabilities.cpp)
 target_include_directories(strix_api_tests SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
 target_link_libraries(strix_api_tests PRIVATE strix_serve)
+
+# CPU-only tests of the prompt cache: turn retention, superseded branches, memory pressure, options.
+foreach(test prompt_cache_turns prompt_cache_regression prompt_cache_memory_pressure prompt_cache_turns_config)
+    add_executable(strix_${test} tests/${test}.cpp)
+    target_include_directories(strix_${test} SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
+    target_link_libraries(strix_${test} PRIVATE strix_serve)
+endforeach()
