@@ -49,6 +49,7 @@ void apply_masks(LogitRows &l, const LogitMasks &masks) {
     masks.check(l.rows, l.row, "apply_masks");
     STRIX_CHECK(l.full.size() == (size_t)(l.rows * l.row), "apply_masks: ", l.full.size(), " floats for ", l.rows,
                 " rows of ", l.row);
+    if (masks.preserve_unmasked && l.unmasked.empty()) l.unmasked = l.full;
     for (int64_t r = 0; r < l.rows; ++r) {
         const uint32_t *m = masks.row(r);
         float *x = l.full.data() + r * l.row;
@@ -65,6 +66,10 @@ LogitRows LogitRows::row_of(int64_t r) const {
         STRIX_CHECK(full.size() == (size_t)(rows * row), "LogitRows::row_of: ", full.size(), " floats for ", rows,
                     " rows of ", row);
         o.full.assign(full.begin() + r * row, full.begin() + (r + 1) * row);
+        if (!unmasked.empty()) {
+            STRIX_CHECK(unmasked.size() == full.size(), "raw target row size mismatch");
+            o.unmasked.assign(unmasked.begin() + r * row, unmasked.begin() + (r + 1) * row);
+        }
     } else {
         STRIX_CHECK(cand_v.size() == (size_t)(rows * cands) && cand_id.size() == cand_v.size() && nan.size() == (size_t)rows,
                     "LogitRows::row_of: candidate arrays ", cand_v.size(), " / ", cand_id.size(), " / ", nan.size(),
