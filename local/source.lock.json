@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "upstream": "https://github.com/shawnshekari/strixite",
-  "upstream_base": "b175d27d7a83cff1d09cbd7fc3108252ba6368d6",
+  "upstream_base": "b455955a89683a16d0b71db0fd20b9f369d524d9",
   "component": "strixite",
   "product_files": {
     "common/trace.hpp": "8860c8b1192df24291944c4ae5d700f203312ab3f38d649a6f360b2a1ccbe671",
