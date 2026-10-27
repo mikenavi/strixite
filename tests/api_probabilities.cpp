@@ -1,4 +1,7 @@
 #include "serve/http_server.hpp"
+#include "serve/boundary_snapshots.hpp"
+#include <future>
+#include <cstdlib>
 #include "serve/openai.hpp"
 #include "serve/token_logprobs.hpp"
 #include "serve/log.hpp"
@@ -27,7 +30,7 @@ void require(bool value, const std::string &why) { ++checks; if(!value) throw st
 class FakeBackend : public LmBackend {
 public:
     explicit FakeBackend(const Tokenizer &t): tok(t), target(t.encode("Москва")[0]), alternative(t.byte_token('A')) { snapshots.fill(-1); }
-    int64_t capacity() const override { return 8192; }
+    int64_t capacity() const override { return context_capacity; }
     int64_t max_chunk() const override { return 4096; }
     int64_t logits_row() const override { return tok.size()+3; }
     int64_t pos() const override { return position; }
@@ -45,6 +48,15 @@ public:
         ++forwards; position+=ids.size(); std::vector<float> all;
         auto values=row();for(int64_t i=0;i<n;++i)all.insert(all.end(),values.begin(),values.end());return all;
     }
+    bool has_vision() const override {return true;}
+    LogitRows forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &im,
+                                    const std::vector<int64_t> &pos3, int64_t n, bool cands,
+                                    int64_t valid, const LogitMasks *masks=nullptr) override {
+        if ((int64_t)ids.size()!=im.rows || pos3.size()!=3*ids.size())
+            throw std::runtime_error("image block was split");
+        ++image_forwards;
+        return forward_rows(ids,n,cands,valid,masks);
+    }
     bool has_mtp() const override {return true;}
     std::vector<float> forward_mtp(int32_t,int64_t) override {return row(true);}
     std::vector<float> forward_verify(const std::vector<int32_t> &ids,int64_t n) override {
@@ -57,15 +69,20 @@ public:
     }
     void keep_verify() override {pending=-1;}
     void drop_verify() override {if(pending>=0)position=pending;pending=-1;}
+    int boundary_snapshot_count() const override {return boundary_count;}
+    int boundary_image_snapshot_count() const override {return std::min(9,boundary_count);}
     void save_snapshot(int slot) override {snapshots.at(slot)=position;}
     int64_t snapshot_pos(int slot) const override {return snapshots.at(slot);}
     bool can_restore_snapshot(int slot) const override {return snapshots.at(slot)>=0;}
-    void restore_snapshot(int slot) override {position=snapshots.at(slot);}
+    void restore_snapshot(int slot) override {position=snapshots.at(slot);for(auto &n:snapshots)if(n>position)n=-1;}
     void export_snapshot(int,HostBuffer&,int64_t=0) override {throw std::runtime_error("unexpected disk export");}
     uint64_t snapshot_bytes(int,int64_t=0) const override {return 0;}
     void import_state(const HostBuffer&,int64_t,int64_t=0) override {throw std::runtime_error("unexpected disk import");}
     std::string state_fingerprint() const override {return "cpu-api-fixture";}
     std::string describe() const override {return "CPU API fixture, no model or GPU";}
+    int image_forwards=0;
+    int boundary_count=0;
+    int64_t context_capacity=8192;
     const Tokenizer &tok;
     int32_t target,alternative;
     std::atomic<int> forwards{0};
@@ -73,7 +90,7 @@ public:
     int32_t verify_end=-1;
 private:
     int64_t position=0,pending=-1;
-    std::array<int64_t,4> snapshots;
+    std::array<int64_t,36> snapshots;
 };
 }
 int main(int argc,char **argv) {
@@ -210,6 +227,72 @@ int main(int argc,char **argv) {
     J partial=chat_token_logprob(TokenLogprob{tok.byte_token(0xd0),-1,std::string(1,(char)0xd0),{}},tok);
     require(partial.at("bytes").as_array()[0].as_int()==0xd0,"split Cyrillic byte not preserved");
     require(complete_utf8_characters("\xd0")==0 && complete_utf8_characters("\xd0\xaf")==1,"split Unicode offsets");
+    // Actual Engine prefill/resume path, CPU backend; no opaque cache-only model.
+    {
+        struct Sink : GenerationSink {
+            std::promise<GenerationResult> done;
+            void on_start() override {}
+            void on_events(std::vector<OutputEvent>&) override {}
+            void on_done(const GenerationResult &r) override { done.set_value(r); }
+            bool cancelled() override {return false;}
+        };
+        FakeBackend b(tok); b.boundary_count=std::getenv("STRIX_TEST_BOUNDARIES_OFF")?0:16;b.context_capacity=524288;
+        Engine::Options opts; opts.think_nudge=false;opts.mtp_draft=1;
+        Engine e(b,tok,opts);
+        auto run=[&](const std::vector<int32_t> &ids, bool vision=false) {
+            GenerationRequest q;q.prompt=ids;q.max_tokens=1;q.sampling.temperature=0;
+            if(vision) {
+                q.cache_key=ids;q.image_pos3.resize(3*ids.size());
+                for(size_t i=0;i<ids.size();++i)for(int j=0;j<3;++j)q.image_pos3[3*i+j]=i;
+                for(int i=46000;i<46032;++i) {q.prompt[i]=tok.id_of("<|image_pad|>");q.cache_key[i]=-999;}
+                PrefillImage im;im.row_start=46000;im.rows=32;im.prefill.grid_t=1;
+                im.prefill.grid_h=8;im.prefill.grid_w=16;im.prefill.pixel_values={0};q.prefill_images.push_back(im);
+            }
+            auto sink=std::make_shared<Sink>();auto result=sink->done.get_future();e.submit(std::move(q),sink);
+            require(result.wait_for(std::chrono::seconds(15))==std::future_status::ready,"boundary request timed out");
+            auto r=result.get();require(r.error.empty(),"boundary generation error: "+r.error);return r;
+        };
+        std::vector<int32_t> ids(267387,tok.byte_token('a'));
+        for(int n:{0,20,45856,90000,140000,200000,240000,260000,267382})ids[n]=tok.id_of("<|im_start|>");
+        require(run(ids).cached_tokens==0,"cold boundary request was not cold");
+        auto changed=ids;changed[240050]=tok.byte_token('b');
+        require(run(changed).cached_tokens==240000,"middle edit missed exact message boundary");
+        changed[45860]=tok.byte_token('c');
+        require(run(changed).cached_tokens==45856,"deep edit missed earlier boundary");
+        changed[260050]=tok.byte_token('d');
+        require(run(changed).cached_tokens==260000,"boundary after rewind was not rebuilt");
+        auto next=changed;next.insert(next.end(),1000,tok.byte_token('z'));
+        require(run(next).cached_tokens>=267382,"append beyond 256K failed");
+        std::vector<int32_t> unrelated(3000,tok.byte_token('x'));run(unrelated);
+        require(run(changed).cached_tokens==0,"unrelated sequence reused stale snapshots");
+        // Keep an old image anchor despite >12 later messages and >4 later prompts.
+        run(unrelated);
+        auto picture=ids;picture[45926]=tok.id_of("<|im_start|>");
+        for(int p=100000;p<260000;p+=5000)picture[p]=tok.id_of("<|im_start|>");
+        require(run(picture,true).cached_tokens==0,"image fixture was not cold");
+        for(int i=0;i<6;++i) {
+            picture.push_back(tok.id_of("<|im_start|>"));picture.insert(picture.end(),1000,tok.byte_token('z'));
+            require(run(picture,true).cached_tokens>260000,"image continuation lost tail");
+        }
+        auto hidden=picture;hidden[45923]=tok.byte_token('b');
+        hidden.erase(hidden.begin()+46000,hidden.begin()+46032);
+        require(run(hidden).cached_tokens==45856,"old image replacement lost protected tool-message start");
+        require(b.image_forwards==1,"cached image was encoded again");
+        // Nine image messages may be relevant across a 3-image retention window + a 6-image tool batch.
+        std::vector<int64_t> nine_images;
+        for(int i=0;i<9;++i)nine_images.push_back(3100+i*2000);
+        // An image is moved into a separate user message by Pi. Its replacement
+        // edits the PRECEDING tool result, so a point only at vision_start is too late.
+        std::vector<int32_t> plan(30000,0);
+        for(int i=0;i<30;++i)plan[i*1000]=tok.id_of("<|im_start|>");
+        const auto nine=boundary_snapshot_plan(plan,tok.id_of("<|im_start|>"),nine_images,1000,29000,16,9);
+        require(nine.size()<=16,"nine-image plan exceeds total slots");
+        require(std::count_if(nine.begin(),nine.end(),[](const auto&p){return p.image;})==9,"image bank does not retain nine distinct predecessors");
+        const auto points=boundary_snapshot_plan(plan,tok.id_of("<|im_start|>"),{6100,11100},1000,29000,16);
+        require(points.size()<=16,"snapshot count exceeded");
+        for(int64_t wanted:{5000,10000})require(std::any_of(points.begin(),points.end(),[&](const auto&p){return p.pos==wanted&&p.image;}),"image predecessor not protected");
+        require(boundary_snapshot_plan(plan,tok.id_of("<|im_start|>"),{6100},1000,29000,0).empty(),"disabled planner changed chunking");
+    }
     std::cout<<"PASS: "<<checks<<" CPU API/probability assertions, including MTP accept/reject and streaming\n";
  }catch(const std::exception &e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}
 }

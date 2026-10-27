@@ -16,7 +16,8 @@ public:
     // n_seqs: conversations held at once (Qwen4ExpSession's slots, each at the full capacity); 1 = today's serving.
     Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp = true,
                     int64_t mtp_vocab = 0, const PrecisionOptions &precision = {}, KvFormat kv = KvFormat::Act,
-                    int64_t n_seqs = 1);
+                    int64_t n_seqs = 1, int boundary_snapshots = 0,
+                    uint64_t boundary_budget_bytes = 2ull << 30, int boundary_images = kDefaultBoundaryImageSnapshots);
     int64_t capacity() const override { return session_.capacity(); }
     int64_t max_chunk() const override { return session_.max_tokens(); }
     int64_t logits_row() const override { return model_.dims().vocab; }
@@ -90,6 +91,11 @@ public:
     // carry -1 (none) is the session's 0; a carried token id 0 is then unchecked (Qwen4ExpSession::keep_verify).
     void keep_verify(int seq, int64_t rows, int32_t carry) override { session_.keep_verify(seq, rows, carry < 0 ? 0 : carry); }
     void drop_verify(int seq) override { session_.drop_verify(seq); }
+    int boundary_snapshot_count() const override { return (int)snapshots_[0].size() - 4; }
+    int boundary_image_snapshot_count() const override { return boundary_images_; }
+    uint64_t boundary_snapshot_bytes() const {
+        return snapshots_[0][0].device_bytes() * boundary_snapshot_count() * snapshots_.size();
+    }
     void save_snapshot(int slot) override { save_snapshot(0, slot); }
     int64_t snapshot_pos(int slot) const override { return snapshot_pos(0, slot); }
     bool can_restore_snapshot(int slot) const override { return can_restore_snapshot(0, slot); }
@@ -111,6 +117,7 @@ public:
     std::string describe() const override;
 
 private:
+    int boundary_images_ = 0;
     LogitRows candidate_rows(int64_t rows) const;  // session_.candidates() of the last forward, checked
     // A batch's per-run masks as one [rows, words] set for want_candidates (runs without masks: every id allowed);
     // empty when no run has any.

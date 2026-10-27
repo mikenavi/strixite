@@ -14,6 +14,7 @@
 // The model sits behind LmBackend, so the loop and the HTTP layer above it are testable without a GPU.
 
 #include "common/check.hpp"
+#include "serve/boundary_snapshots.hpp"
 #include "serve/capture.hpp"
 #include "serve/output_parser.hpp"
 #include "serve/prompt_cache.hpp"
@@ -262,6 +263,12 @@ public:
     // the start of the prompt's last user message - the user-turn checkpoint (for the disk cache): a client that
     // later rewrites that message (e.g. drops a reminder it appended) still resumes here, not at the system prefix.
     static constexpr int kTurnSlot = 0, kSystemSlot = 1, kDraftSlot = 2, kUserSlot = 3;
+    // Optional extra live-sequence snapshots, slots [4, 4 + count). Fixed at startup.
+    // Imports/resets/rewinds must invalidate them just like the original four slots.
+    virtual int boundary_snapshot_count() const { return 0; }
+    virtual int boundary_image_snapshot_count() const {
+        return std::min(boundary_snapshot_count(), kDefaultBoundaryImageSnapshots);
+    }
     virtual void save_snapshot(int slot) = 0;
     virtual int64_t snapshot_pos(int slot) const = 0;  // -1 if none
     virtual bool can_restore_snapshot(int slot) const = 0;
